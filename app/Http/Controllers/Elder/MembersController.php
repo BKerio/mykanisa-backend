@@ -1,0 +1,171 @@
+<?php
+
+namespace App\Http\Controllers\Elder;
+
+use App\Http\Controllers\Controller;
+use App\Models\Member;
+use App\Models\Group;
+use App\Models\User;
+use Illuminate\Http\Request;
+
+class MembersController extends Controller
+{
+    /**
+     * Display a listing of members (Elder has full admin access)
+     */
+    public function index(Request $request)
+    {
+        $perPage = (int)($request->query('per_page', 20));
+        $search = trim((string)$request->query('q', ''));
+
+        $query = Member::query();
+        if ($search !== '') {
+            $query->where(function($q) use ($search) {
+                $q->where('full_name', 'like', "%{$search}%")
+                  ->orWhere('e_kanisa_number', 'like', "%{$search}%")
+                  ->orWhere('telephone', 'like', "%{$search}%")
+                  ->orWhere('email', 'like', "%{$search}%");
+            });
+        }
+
+        $members = $query->orderByDesc('id')->paginate($perPage);
+        
+        // Transform the data to include group names and profile image URL
+        $members->getCollection()->transform(function ($member) {
+            $member->group_names = $this->getGroupNames($member->groups);
+            $member->profile_image_url = $member->profile_image 
+                ? asset('storage/' . $member->profile_image) 
+                : null;
+            return $member;
+        });
+
+        return $members;
+    }
+
+    /**
+     * Display the specified member
+     */
+    public function show(Request $request, Member $member)
+    {
+        // Elder has full permissions - fetch like admin
+        $member->group_names = $this->getGroupNames($member->groups);
+        return $member;
+    }
+
+    /**
+     * Create a new member (elder can create members in their scope)
+     */
+    public function store(Request $request)
+    {
+        $validated = $request->validate([
+            'full_name' => 'required|string|max:255',
+            'email' => 'required|email|unique:members,email',
+            'national_id' => 'required|string|unique:members,national_id',
+            'date_of_birth' => 'required|date',
+            'gender' => 'required|in:male,female',
+            'marital_status' => 'required|string',
+            'telephone' => 'required|string|unique:members,telephone',
+            'congregation' => 'required|string',
+            'parish' => 'required|string',
+            'presbytery' => 'required|string',
+            'district' => 'nullable|string',
+        ]);
+
+        $validated['region'] = $request->input('region', 'Nairobi');
+        $validated['is_active'] = true;
+        
+        $member = Member::create($validated);
+        
+        return response()->json([
+            'status' => 200,
+            'message' => 'Member created successfully',
+            'member' => $member
+        ], 201);
+    }
+
+    /**
+     * Update the specified member
+     */
+    public function update(Request $request, Member $member)
+    {
+        // Elder has full permissions - update like admin
+        $validated = $request->validate([
+            'full_name' => 'sometimes|string|max:255',
+            'telephone' => 'sometimes|string|max:50|unique:members,telephone,' . $member->id,
+            'email' => 'sometimes|email|unique:members,email,' . $member->id,
+            'role' => 'sometimes|string|in:member,deacon,elder,pastor,secretary,treasurer,choir_leader,group_leader,chairman,sunday_school_teacher',
+        ]);
+        $member->update($validated);
+        
+        // Also update the corresponding user's name if full_name was updated
+        // This ensures consistency across all related tables (members and users)
+        if (array_key_exists('full_name', $validated)) {
+            $user = User::where('email', $member->email)->first();
+            if ($user) {
+                $user->name = $validated['full_name'];
+                $user->save();
+            }
+        }
+        
+        $member->group_names = $this->getGroupNames($member->groups);
+        return $member;
+    }
+
+    /**
+     * Remove the specified resource from storage.
+     */
+    public function destroy(Member $member)
+    {
+        // Elder has full permissions - can delete members
+        $member->delete();
+        return response()->json(['message' => 'Deleted']);
+    }
+
+    /**
+     * Toggle the active status of a member account
+     */
+    public function toggleStatus(Member $member)
+    {
+        // Toggle the status
+        $member->is_active = !$member->is_active;
+        $member->save();
+
+        // Sync to the associated user account
+        $user = User::where('email', $member->email)->first();
+        if ($user) {
+            $user->is_active = $member->is_active;
+            $user->save();
+        }
+
+        $statusLabel = $member->is_active ? 'enabled' : 'disabled';
+        
+        return response()->json([
+            'status' => 200,
+            'message' => "Member account {$statusLabel} successfully",
+            'is_active' => $member->is_active
+        ]);
+    }
+
+    /**
+     * Get group names from group IDs JSON string
+     */
+    private function getGroupNames($groupsJson)
+    {
+        if (empty($groupsJson)) {
+            return [];
+        }
+
+        try {
+            $groupIds = json_decode($groupsJson, true);
+            if (!is_array($groupIds)) {
+                return [];
+            }
+
+            $groups = Group::whereIn('id', $groupIds)->pluck('name')->toArray();
+            return $groups;
+        } catch (\Exception $e) {
+            return [];
+        }
+    }
+}
+

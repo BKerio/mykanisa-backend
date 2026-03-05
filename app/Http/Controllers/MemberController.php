@@ -1,0 +1,888 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Member;
+use App\Models\Dependency;
+use App\Models\User;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\DB;
+use Carbon\Carbon;
+use Illuminate\Support\Facades\Hash;
+use App\Mail\WelcomeMemberMail;
+use App\Services\SmsService;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\Log;
+use App\Jobs\SendWelcomeSms;
+
+class MemberController extends Controller
+{
+    public function register(Request $request)
+    {
+        // Handle JSON-encoded arrays from multipart form data
+        $dependenciesInput = $request->input('dependencies');
+        $groupIdsInput = $request->input('group_ids');
+        
+        if (is_string($dependenciesInput)) {
+            $dependenciesInput = json_decode($dependenciesInput, true) ?? [];
+            $request->merge(['dependencies' => $dependenciesInput]);
+        }
+        if (is_string($groupIdsInput)) {
+            $groupIdsInput = json_decode($groupIdsInput, true) ?? [];
+            $request->merge(['group_ids' => $groupIdsInput]);
+        }
+        
+        // Handle boolean values from string inputs (multipart forms send as strings)
+        if ($request->has('is_baptized') && is_string($request->input('is_baptized'))) {
+            $request->merge(['is_baptized' => $request->input('is_baptized') === 'true']);
+        }
+        if ($request->has('takes_holy_communion') && is_string($request->input('takes_holy_communion'))) {
+            $request->merge(['takes_holy_communion' => $request->input('takes_holy_communion') === 'true']);
+        }
+        
+        $validated = $request->validate([
+            'full_name' => 'required|string|max:255',
+            'date_of_birth' => 'required|date',
+            'national_id' => 'nullable|string|max:50',
+            'email' => 'required|email|unique:members,email',
+            'gender' => 'required|in:Male,Female',
+            'marital_status' => 'required|in:Single,Married (Customary),Married (Church Wedding),Divorced,Widow,Widower,Separated',
+            'is_baptized' => 'boolean',
+            'takes_holy_communion' => 'boolean',
+            'region' => 'required|string|max:100',
+            'presbytery' => 'required|string|max:100',
+            'parish' => 'required|string|max:100',
+            'district' => 'required|string|max:100',
+            'congregation' => 'required|string|max:100',
+            'telephone' => 'nullable|string|max:30|unique:members,telephone',
+            'password' => 'required|min:6|confirmed',
+            'profile_image' => 'nullable|image|mimes:jpeg,png,jpg,gif|max:2048',
+            'dependencies' => 'array',
+            'group_ids' => 'array',
+            'group_ids.*' => 'integer|exists:groups,id',
+            'dependencies.*.name' => 'required_with:dependencies|string|max:255',
+            'dependencies.*.year_of_birth' => 'required_with:dependencies|integer|min:1900|max:'.date('Y'),
+            'dependencies.*.birth_cert_number' => 'nullable|digits:9',
+            'dependencies.*.is_baptized' => 'boolean',
+            'dependencies.*.takes_holy_communion' => 'boolean',
+            'dependencies.*.school' => 'nullable|string|max:255',
+        ]);
+
+        // Age auto-calc and national_id rule for 18+
+        $age = Carbon::parse($validated['date_of_birth'])->age;
+        if ($age >= 18 && empty($validated['national_id'])) {
+            return response()->json(['status' => 422, 'message' => 'National ID is required for members aged 18+'], 422);
+        }
+
+        $ekanisa = $this->generateEkanisaNumber();
+
+        return DB::transaction(function () use ($validated, $age, $ekanisa, $request) {
+            // Handle profile image upload if provided
+            $profileImagePath = null;
+            if ($request->hasFile('profile_image')) {
+                try {
+                    $profileImagePath = $request->file('profile_image')->store('profiles', 'public');
+                } catch (\Exception $e) {
+                    Log::error('Failed to upload profile image during registration', [
+                        'error' => $e->getMessage(),
+                    ]);
+                    // Continue registration even if image upload fails
+                }
+            }
+
+            $member = Member::create([
+                'full_name' => $validated['full_name'],
+                'date_of_birth' => $validated['date_of_birth'],
+                'age' => $age,
+                'national_id' => $validated['national_id'] ?? null,
+                'email' => $validated['email'],
+                'gender' => $validated['gender'],
+                'marital_status' => $validated['marital_status'],
+                'is_baptized' => (bool)($validated['is_baptized'] ?? false),
+                'takes_holy_communion' => (bool)($validated['takes_holy_communion'] ?? false),
+                'region' => $validated['region'],
+                'presbytery' => $validated['presbytery'],
+                'parish' => $validated['parish'],
+                'district' => $validated['district'],
+                'congregation' => $validated['congregation'],
+                'groups' => !empty($validated['group_ids']) ? json_encode($validated['group_ids']) : null,
+                'e_kanisa_number' => $ekanisa,
+                'telephone' => $validated['telephone'] ?? null,
+                'profile_image' => $profileImagePath,
+            ]);
+
+            foreach (($validated['dependencies'] ?? []) as $index => $dep) {
+                // Prevent duplicates for THIS member only
+                $query = Dependency::where('member_id', $member->id);
+                if (!empty($dep['birth_cert_number'])) {
+                    $query->where('birth_cert_number', $dep['birth_cert_number']);
+                } else {
+                    $query->where('name', $dep['name'])
+                          ->where('year_of_birth', $dep['year_of_birth']);
+                }
+                $existing = $query->first();
+                if ($existing) {
+                    continue; // skip duplicates for this member
+                }
+
+                // Handle dependent photos
+                $depPhotos = [];
+                // Frontend sends dependent_photos_{index}[]
+                if ($request->hasFile("dependent_photos_{$index}")) {
+                    $files = $request->file("dependent_photos_{$index}");
+                    // Ensure max 3
+                    $files = is_array($files) ? array_slice($files, 0, 3) : [$files]; 
+                    
+                    foreach ($files as $file) {
+                        try {
+                            $path = $file->store('dependents', 'public');
+                            $depPhotos[] = $path;
+                        } catch (\Exception $e) {
+                            Log::error("Failed to upload photo for dependent index {$index}", ['error' => $e->getMessage()]);
+                        }
+                    }
+                }
+
+                Dependency::create([
+                    'member_id' => $member->id,
+                    'name' => $dep['name'],
+                    'year_of_birth' => $dep['year_of_birth'],
+                    'birth_cert_number' => $dep['birth_cert_number'] ?? null,
+                    'is_baptized' => (bool)($dep['is_baptized'] ?? false),
+                    'takes_holy_communion' => (bool)($dep['takes_holy_communion'] ?? false),
+                    'school' => $dep['school'] ?? null,
+                    'photos' => $depPhotos,
+                ]);
+            }
+
+            try {
+                Mail::to($member->email)->queue(new WelcomeMemberMail($member));
+            } catch (\Exception $e) {
+                Log::error('Failed to queue welcome email', ['error' => $e->getMessage()]);
+            }
+
+            if (!empty($member->telephone)) {
+                try {
+                    SendWelcomeSms::dispatch($member);
+                } catch (\Exception $e) {
+                    Log::error('Failed to dispatch welcome SMS', ['error' => $e->getMessage()]);
+                }
+            }
+
+            // Create or update a login account for this member (mandatory password)
+            $user = User::where('email', $validated['email'])->first();
+            if ($user) {
+                $user->name = $validated['full_name'];
+                $user->password = Hash::make($validated['password']);
+                $user->save();
+            } else {
+                User::create([
+                    'name' => $validated['full_name'],
+                    'email' => $validated['email'],
+                    'password' => Hash::make($validated['password']),
+                ]);
+            }
+
+            $memberData = $member->toArray();
+            if ($member->profile_image) {
+                $memberData['profile_image_url'] = asset('storage/'.$member->profile_image);
+            }
+
+            return response()->json([
+                'status' => 200,
+                'member' => $memberData
+            ]);
+        });
+    }
+
+#------------Start od our Logic to generate  PCEA E-Kanisa number----------------
+   private function generateEkanisaNumber(): string
+{
+    $letters = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+    $digits  = '23456789';
+
+    do {
+        
+        $digitArray = str_split($digits);
+        shuffle($digitArray);
+        $digitPart = implode('', array_slice($digitArray, 0, 3));
+
+        $letterArray = str_split($letters);
+        shuffle($letterArray);
+        $letterPart = implode('', array_slice($letterArray, 0, 3));
+
+        $code = 'PCEA-' . $digitPart . $letterPart;
+
+    } while (\App\Models\Member::where('e_kanisa_number', $code)->exists());
+
+    return $code;
+}
+
+
+    //------------End of our Logic to generate  PCEA My Kanisa number----------------
+    public function me(Request $request)
+    {
+        $user = $request->user();
+        if (!$user) {
+            return response()->json(['status' => 401, 'message' => 'Unauthorized'], 401);
+        }
+        $member = Member::where('email', $user->email)->first();
+        if (!$member) {
+            return response()->json(['status' => 404, 'message' => 'Member not found'], 404);
+        }
+        $memberArray = $member->toArray();
+
+        // Fetch role metadata from the database
+        $roleInfo = \App\Models\Role::where('slug', $member->role)->first();
+        if ($roleInfo) {
+            $memberArray['role_name'] = $roleInfo->name;
+            $memberArray['role_description'] = $roleInfo->description;
+        }
+
+        if (!empty($member->profile_image)) {
+            $memberArray['profile_image_url'] = asset('storage/'.$member->profile_image);
+        }
+        if (!empty($member->passport_image)) {
+            $memberArray['passport_image_url'] = asset('storage/'.$member->passport_image);
+        }
+        if (!empty($member->marriage_certificate_path)) {
+            $memberArray['marriage_certificate_url'] = asset('storage/'.$member->marriage_certificate_path);
+        }
+        return response()->json(['status' => 200, 'member' => $memberArray]);
+    }
+
+    /**
+     * Get members for minutes page (authenticated users)
+     */
+    public function getMembersForMinutes(Request $request)
+    {
+        $user = $request->user();
+        if (!$user) {
+            return response()->json(['status' => 401, 'message' => 'Unauthorized'], 401);
+        }
+
+        $query = Member::query();
+        
+        // Filter by congregation if user has a specific congregation
+        $member = Member::where('email', $user->email)->first();
+        if ($member && $member->congregation) {
+            $query->where('congregation', $member->congregation);
+        }
+        
+        $members = $query->select(['id', 'full_name', 'e_kanisa_number', 'congregation'])
+            ->orderBy('full_name')
+            ->get();
+            
+        return response()->json([
+            'status' => 200,
+            'members' => $members
+        ]);
+    }
+
+    public function updateMe(Request $request)
+    {
+        $user = $request->user();
+        if (!$user) {
+            return response()->json(['status' => 401, 'message' => 'Unauthorized'], 401);
+        }
+        $member = Member::where('email', $user->email)->first();
+        if (!$member) {
+            return response()->json(['status' => 404, 'message' => 'Member not found'], 404);
+        }
+
+        $validated = $request->validate([
+            'full_name' => 'sometimes|required|string|max:255',
+            'date_of_birth' => 'sometimes|required|date',
+            'national_id' => 'nullable|string|max:50',
+            'gender' => 'sometimes|required|in:Male,Female',
+            'marital_status' => 'sometimes|required|in:Single,Married (Customary),Married (Church Wedding),Divorced,Widow,Widower,Separated',
+            'is_baptized' => 'boolean',
+            'takes_holy_communion' => 'boolean',
+            'presbytery' => 'sometimes|required|string|max:100',
+            'parish' => 'sometimes|required|string|max:100',
+            'congregation' => 'sometimes|required|string|max:100',
+            'groups' => 'nullable|string',
+            'telephone' => 'nullable|string|max:30',
+            'location_county' => 'nullable|string|max:100',
+            'location_subcounty' => 'nullable|string|max:100',
+        ]);
+
+        if (array_key_exists('date_of_birth', $validated)) {
+            $validated['age'] = Carbon::parse($validated['date_of_birth'])->age;
+        }
+
+        $member->fill($validated);
+        $member->save();
+
+        // Also update the corresponding user's name if full_name was updated
+        // This ensures consistency across all related tables
+        if (array_key_exists('full_name', $validated)) {
+            if ($user) {
+                $user->name = $validated['full_name'];
+                $user->save();
+            }
+        }
+
+        return response()->json(['status' => 200, 'member' => $member, 'message' => 'Profile updated']);
+    }
+
+    public function updateAvatar(Request $request)
+    {
+        Log::info('updateAvatar called', [
+            'user_id' => $request->user()?->id,
+            'user_email' => $request->user()?->email,
+            'has_file' => $request->hasFile('image'),
+        ]);
+        
+        $user = $request->user();
+        if (!$user) {
+            return response()->json(['status' => 401, 'message' => 'Unauthorized'], 401);
+        }
+        
+        $member = Member::where('email', $user->email)->first();
+        if (!$member) {
+            Log::error('Member not found for user', [
+                'user_id' => $user->id,
+                'user_email' => $user->email,
+            ]);
+            return response()->json(['status' => 404, 'message' => 'Member not found'], 404);
+        }
+
+        $request->validate([
+            'image' => 'required|image|mimes:jpg,jpeg,png|max:2048',
+        ]);
+
+        try {
+            Log::info('Processing avatar upload', [
+                'member_id' => $member->id,
+                'email' => $member->email,
+                'has_file' => $request->hasFile('image'),
+            ]);
+            
+            // Delete old profile image if exists
+            if ($member->profile_image && Storage::disk('public')->exists($member->profile_image)) {
+                Storage::disk('public')->delete($member->profile_image);
+            }
+            
+            $path = $request->file('image')->store('profiles', 'public');
+            $member->profile_image = $path;
+            $member->save();
+            
+            Log::info('Member profile_image updated successfully', [
+                'member_id' => $member->id,
+                'email' => $member->email,
+                'profile_image' => $path,
+            ]);
+        } catch (\Throwable $e) {
+            Log::error('Failed to update profile_image', [
+                'member_id' => $member->id ?? null,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+            return response()->json([
+                'status' => 500,
+                'message' => 'Failed to save profile image: ' . $e->getMessage()
+            ], 500);
+        }
+
+        return response()->json([
+            'status' => 200,
+            'message' => 'Profile image updated successfully',
+            'profile_image' => $path,
+            'profile_image_url' => asset('storage/'.$path)
+        ]);
+    }
+
+    public function updatePassport(Request $request)
+    {
+        Log::info('updatePassport called', [
+            'user_id' => $request->user()?->id,
+            'user_email' => $request->user()?->email,
+            'has_file' => $request->hasFile('image'),
+        ]);
+        
+        $user = $request->user();
+        if (!$user) {
+            return response()->json(['status' => 401, 'message' => 'Unauthorized'], 401);
+        }
+        
+        $member = Member::where('email', $user->email)->first();
+        if (!$member) {
+            Log::error('Member not found for user', [
+                'user_id' => $user->id,
+                'user_email' => $user->email,
+            ]);
+            return response()->json(['status' => 404, 'message' => 'Member not found'], 404);
+        }
+
+        $request->validate([
+            'image' => 'required|image|mimes:jpg,jpeg,png|max:2048',
+        ]);
+
+        try {
+            Log::info('Processing passport upload', [
+                'member_id' => $member->id,
+                'email' => $member->email,
+                'has_file' => $request->hasFile('image'),
+            ]);
+            
+            // Delete old passport image if exists
+            if ($member->passport_image && Storage::disk('public')->exists($member->passport_image)) {
+                Storage::disk('public')->delete($member->passport_image);
+            }
+            
+            $path = $request->file('image')->store('passports', 'public');
+            $member->passport_image = $path;
+            $member->save();
+            
+            Log::info('Member passport_image updated successfully', [
+                'member_id' => $member->id,
+                'email' => $member->email,
+                'passport_image' => $path,
+            ]);
+        } catch (\Throwable $e) {
+            Log::error('Failed to update passport_image', [
+                'member_id' => $member->id ?? null,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+            return response()->json([
+                'status' => 500,
+                'message' => 'Failed to save passport image: ' . $e->getMessage()
+            ], 500);
+        }
+
+        return response()->json([
+            'status' => 200,
+            'message' => 'Passport image updated successfully',
+            'passport_image' => $path,
+            'passport_image_url' => asset('storage/'.$path)
+        ]);
+    }
+
+    public function updateDependentImage(Request $request, $id)
+    {
+        $user = $request->user();
+        if (!$user) {
+            return response()->json(['status' => 401, 'message' => 'Unauthorized'], 401);
+        }
+        $member = Member::where('email', $user->email)->first();
+        if (!$member) {
+            return response()->json(['status' => 404, 'message' => 'Member not found'], 404);
+        }
+
+        $dependent = Dependency::where('id', $id)->where('member_id', $member->id)->first();
+        if (!$dependent) {
+            return response()->json(['status' => 404, 'message' => 'Dependent not found'], 404);
+        }
+
+        $request->validate([
+            'image' => 'required|image|mimes:jpg,jpeg,png|max:2048',
+        ]);
+
+        $path = $request->file('image')->store('dependents', 'public');
+        $dependent->image = $path;
+        $dependent->save();
+
+        return response()->json([
+            'status' => 200,
+            'image' => $path,
+            'image_url' => asset('storage/'.$path)
+        ]);
+    }
+
+    public function getDependents(Request $request)
+    {
+        $user = $request->user();
+        $member = Member::where('email', $user->email)->first();
+
+        if (!$member) {
+            return response()->json(['status' => 404, 'message' => 'Member not found'], 404);
+        }
+
+        $dependents = Dependency::where('member_id', $member->id)
+            ->orderBy('created_at', 'desc')
+            ->get()
+            ->map(function($dep) {
+                $arr = $dep->toArray();
+                if (!empty($dep->image)) {
+                    $arr['image_url'] = asset('storage/'.$dep->image);
+                }
+                if (!empty($dep->photos)) {
+                    $arr['photo_urls'] = array_map(function($photo) {
+                        return asset('storage/'.$photo);
+                    }, $dep->photos);
+                }
+                return $arr;
+            });
+
+        return response()->json([
+            'status' => 200,
+            'dependents' => $dependents
+        ]);
+    }
+
+    public function addDependent(Request $request)
+    {
+        $validated = $request->validate([
+            'name' => 'required|string|max:255',
+            'year_of_birth' => 'required|integer|min:1900|max:' . date('Y'),
+            'birth_cert_number' => 'nullable|digits:9',
+            'is_baptized' => 'boolean',
+            'takes_holy_communion' => 'boolean',
+            'school' => 'nullable|string|max:255',
+            'photos.*' => 'image|mimes:jpeg,png,jpg,gif|max:2048',
+        ]);
+
+        $user = $request->user();
+        $member = Member::where('email', $user->email)->first();
+
+        if (!$member) {
+            return response()->json(['status' => 404, 'message' => 'Member not found'], 404);
+        }
+
+        // Check for duplicate dependents globally (across all members)
+        $duplicateCheck = Dependency::where('name', $validated['name'])
+            ->where('year_of_birth', $validated['year_of_birth'])
+            ->when(($validated['birth_cert_number'] ?? null), function($query, $certNumber) {
+                return $query->where('birth_cert_number', $certNumber);
+            })
+            ->first();
+
+        if ($duplicateCheck) {
+            return response()->json([
+                'status' => 409,
+                'message' => 'A dependent with this name, birth year' . 
+                           (($validated['birth_cert_number'] ?? null) ? ', and birth certificate number' : '') . 
+                           ' already exists in the system.'
+            ], 409);
+        }
+
+        $photoPaths = [];
+        if ($request->hasFile('photos')) {
+            $files = $request->file('photos');
+            // Ensure we only take up to 3 photos
+            $files = array_slice($files, 0, 3);
+            
+            foreach ($files as $file) {
+                $path = $file->store('dependents', 'public');
+                $photoPaths[] = $path;
+            }
+        }
+
+        // Create new dependent
+        $dependent = new Dependency([
+            'member_id' => $member->id,
+            'name' => $validated['name'],
+            'year_of_birth' => $validated['year_of_birth'],
+            'birth_cert_number' => $validated['birth_cert_number'] ?? null,
+            'is_baptized' => filter_var($request->input('is_baptized'), FILTER_VALIDATE_BOOLEAN),
+            'takes_holy_communion' => filter_var($request->input('takes_holy_communion'), FILTER_VALIDATE_BOOLEAN),
+            'school' => $validated['school'] ?? null,
+            'photos' => $photoPaths,
+        ]);
+
+        $dependent->save();
+
+        return response()->json([
+            'status' => 200,
+            'message' => 'Dependent added successfully',
+            'dependent' => $dependent
+        ]);
+    }
+
+    public function updateDependent(Request $request, $id)
+    {
+        $validated = $request->validate([
+            'name' => 'required|string|max:255',
+            'year_of_birth' => 'required|integer|min:1900|max:' . date('Y'),
+            'birth_cert_number' => 'nullable|digits:9',
+            'is_baptized' => 'boolean',
+            'takes_holy_communion' => 'boolean',
+            'school' => 'nullable|string|max:255',
+            'photos.*' => 'image|mimes:jpeg,png,jpg,gif|max:2048',
+            'kept_photos' => 'nullable|string', // JSON string of photo paths to keep
+        ]);
+
+        $user = $request->user();
+        $member = Member::where('email', $user->email)->first();
+
+        if (!$member) {
+            return response()->json(['status' => 404, 'message' => 'Member not found'], 404);
+        }
+
+        $dependent = Dependency::where('id', $id)
+            ->where('member_id', $member->id)
+            ->first();
+
+        if (!$dependent) {
+            return response()->json(['status' => 404, 'message' => 'Dependent not found'], 404);
+        }
+
+        // Check for duplicate dependents globally (excluding current one)
+        $duplicateCheck = Dependency::where('name', $validated['name'])
+            ->where('year_of_birth', $validated['year_of_birth'])
+            ->when(($validated['birth_cert_number'] ?? null), function($query, $certNumber) {
+                return $query->where('birth_cert_number', $certNumber);
+            })
+            ->where('id', '!=', $id)
+            ->first();
+
+        if ($duplicateCheck) {
+            return response()->json([
+                'status' => 409,
+                'message' => 'A dependent with this name, birth year' . 
+                           (($validated['birth_cert_number'] ?? null) ? ', and birth certificate number' : '') . 
+                           ' already exists in the system.'
+            ], 409);
+        }
+
+        // Process Photos
+        // 1. Get currently stored photos
+        $currentPhotos = $dependent->photos ?? [];
+        
+        // 2. Determine which old photos to keep
+        $keptPhotos = [];
+        if ($request->has('kept_photos')) {
+             $keptInput = $request->input('kept_photos');
+             // Handle if it comes as JSON string or array (standardizing)
+             $keptList = is_string($keptInput) ? json_decode($keptInput, true) : $keptInput;
+             $keptList = is_array($keptList) ? $keptList : [];
+             
+             // Verify these photos actually belong to the dependent
+             foreach ($keptList as $path) {
+                 if (in_array($path, $currentPhotos)) {
+                     $keptPhotos[] = $path;
+                 }
+             }
+        }
+        
+        // 3. Delete photos that were removed (in current but not in kept)
+        foreach ($currentPhotos as $path) {
+            if (!in_array($path, $keptPhotos)) {
+                if (Storage::disk('public')->exists($path)) {
+                    Storage::disk('public')->delete($path);
+                }
+            }
+        }
+
+        // 4. Add new photos
+        $finalPhotos = $keptPhotos;
+        if ($request->hasFile('photos')) {
+            $files = $request->file('photos');
+            // Calculate how many more we can add
+            $remainingSlots = 3 - count($finalPhotos);
+            
+            if ($remainingSlots > 0) {
+                $filesToAdd = array_slice($files, 0, $remainingSlots);
+                foreach ($filesToAdd as $file) {
+                    $path = $file->store('dependents', 'public');
+                    $finalPhotos[] = $path;
+                }
+            }
+        }
+
+        // Update dependent
+        $dependent->update([
+            'name' => $validated['name'],
+            'year_of_birth' => $validated['year_of_birth'],
+            'birth_cert_number' => $validated['birth_cert_number'] ?? null,
+            'is_baptized' => filter_var($request->input('is_baptized'), FILTER_VALIDATE_BOOLEAN),
+            'takes_holy_communion' => filter_var($request->input('takes_holy_communion'), FILTER_VALIDATE_BOOLEAN),
+            'school' => $validated['school'] ?? null,
+            'photos' => $finalPhotos,
+        ]);
+
+        return response()->json([
+            'status' => 200,
+            'message' => 'Dependent updated successfully',
+            'dependent' => $dependent
+        ]);
+    }
+
+    /**
+     * Get Member Digital File (Aggregated Data)
+     */
+    public function getDigitalFile(Request $request, $id)
+    {
+        $user = $request->user();
+        if (!$user) {
+             return response()->json(['status' => 401, 'message' => 'Unauthorized'], 401);
+        }
+
+        $member = Member::with(['dependencies', 'groups'])->find($id);
+
+        if (!$member) {
+            return response()->json(['status' => 404, 'message' => 'Member not found'], 404);
+        }
+
+        // 1. Attendance (General System)
+        $attendances = DB::table('attendances')
+            ->where('member_id', $member->id)
+            ->orderBy('event_date', 'desc')
+            ->get();
+
+        // 2. Minute Attendance (Official Meetings)
+        $meetingAttendance = DB::table('minute_attendees')
+            ->join('minutes', 'minute_attendees.minute_id', '=', 'minutes.id')
+            ->where('minute_attendees.member_id', $member->id)
+            ->select('minutes.title', 'minutes.meeting_date', 'minutes.meeting_type', 'minute_attendees.status')
+            ->orderBy('minutes.meeting_date', 'desc')
+            ->get();
+
+        // 3. Contributions
+        $contributions = DB::table('contributions')
+            ->where('member_id', $member->id)
+            ->orderBy('contribution_date', 'desc')
+            ->get();
+
+        // 4. Action Items (Tasks)
+        $tasks = DB::table('minute_action_items')
+            ->join('minutes', 'minute_action_items.minute_id', '=', 'minutes.id')
+            ->where('minute_action_items.responsible_member_id', $member->id)
+            ->select('minute_action_items.*', 'minutes.title as meeting_title', 'minutes.meeting_date')
+            ->orderBy('minutes.meeting_date', 'desc')
+            ->get();
+            
+        // 6. Audit Logs
+        $auditLogs = [];
+        $linkedUser = User::where('email', $member->email)->first();
+        if ($linkedUser) {
+            $auditLogs = DB::table('audit_logs')
+                ->where('user_id', $linkedUser->id)
+                ->orderBy('created_at', 'desc')
+                ->limit(50)
+                ->get();
+        }
+
+        // 7. Communication Logs (Messages sent to/from member)
+        // Get member's groups
+        $groupIds = $member->groups()->pluck('groups.id')->toArray();
+
+        $communications = \App\Models\Announcement::where(function($q) use ($member, $groupIds) {
+                // Sent by the member
+                $q->where('sent_by', $member->id)
+                  // Received by member (Individual)
+                  ->orWhere(function($sub) use ($member) {
+                      $sub->where('recipient_id', $member->id)
+                          ->where('type', 'individual');
+                  })
+                  // Received by member's group
+                  ->orWhere(function($sub) use ($groupIds) {
+                      $sub->whereIn('recipient_id', $groupIds)
+                          ->where('type', 'group');
+                  })
+                  // Broadcasts (sent to everyone)
+                  ->orWhere('type', 'broadcast');
+            })
+            ->with(['sender:id,full_name,role'])
+            ->orderBy('created_at', 'desc')
+            ->get()
+            ->map(function($comm) {
+                // Manually resolve recipient/context based on type
+                $commArray = $comm->toArray();
+                
+                if ($comm->type === 'individual') {
+                    $recipient = \App\Models\Member::find($comm->recipient_id);
+                    $commArray['recipient_name'] = $recipient ? $recipient->full_name : 'Unknown';
+                    $commArray['context'] = 'Individual Connection';
+                } elseif ($comm->type === 'group') {
+                    $group = \App\Models\Group::find($comm->recipient_id);
+                    $commArray['recipient_name'] = $group ? $group->name : 'Unknown Group';
+                    $commArray['context'] = 'Group: ' . $commArray['recipient_name'];
+                } elseif ($comm->type === 'broadcast') {
+                    $commArray['recipient_name'] = 'All Members';
+                    $commArray['context'] = 'Broadcast';
+                }
+
+                return $commArray;
+            });
+
+        // Format Photos for Dependents
+        $memberArray = $member->toArray();
+        if (!empty($member->profile_image)) {
+            $memberArray['profile_image_url'] = asset('storage/'.$member->profile_image);
+        }
+        if (!empty($member->marriage_certificate_path)) {
+            $memberArray['marriage_certificate_url'] = asset('storage/'.$member->marriage_certificate_path);
+        }
+        $memberArray['dependencies'] = collect($memberArray['dependencies'])->map(function($dep) {
+             if (!empty($dep['photos'])) {
+                $dep['photo_urls'] = array_map(function($p) { return asset('storage/'.$p); }, $dep['photos']);
+             }
+             return $dep;
+        });
+
+        // 8. Pledges
+        $pledges = DB::table('pledges')
+            ->where('member_id', $member->id)
+            ->orderBy('pledge_date', 'desc')
+            ->get();
+
+        return response()->json([
+            'status' => 200,
+            'data' => [
+                'profile' => $memberArray,
+                'attendances' => $attendances,
+                'meeting_attendance' => $meetingAttendance,
+                'contributions' => $contributions,
+                'tasks' => $tasks,
+                'audit_logs' => $auditLogs,
+                'communications' => $communications,
+                'pledges' => $pledges,
+            ]
+        ]);
+    }
+
+    public function uploadMarriageCertificate(Request $request)
+    {
+        $user = $request->user();
+        if (!$user) {
+            return response()->json(['status' => 401, 'message' => 'Unauthorized'], 401);
+        }
+
+        $member = $user->member;
+        if (!$member) {
+            return response()->json(['status' => 404, 'message' => 'Member profile not found for this user'], 404);
+        }
+
+        if (!str_starts_with($member->marital_status, 'Married')) {
+             return response()->json(['status' => 403, 'message' => 'Only married members can upload a marriage certificate'], 403);
+        }
+
+        // Validate
+        $request->validate([
+            'certificate' => 'required|file|mimes:pdf|max:5120', // Max 5MB PDF
+        ]);
+
+        try {
+            if ($request->hasFile('certificate')) {
+                // Delete old file if exists
+                if ($member->marriage_certificate_path && \Illuminate\Support\Facades\Storage::disk('public')->exists($member->marriage_certificate_path)) {
+                    \Illuminate\Support\Facades\Storage::disk('public')->delete($member->marriage_certificate_path);
+                }
+
+                // Store new file
+                $path = $request->file('certificate')->store('marriage_certificates', 'public');
+                
+                $member->marriage_certificate_path = $path;
+                $member->save();
+
+                return response()->json([
+                    'status' => 200, 
+                    'message' => 'Marriage certificate uploaded successfully',
+                    'url' => asset('storage/' . $path)
+                ]);
+            }
+
+            return response()->json(['status' => 400, 'message' => 'No file uploaded'], 400);
+
+        } catch (\Exception $e) {
+            Log::error('Error uploading marriage certificate: ' . $e->getMessage());
+            return response()->json(['status' => 500, 'message' => 'Upload failed'], 500);
+        }
+    }
+}
+
+
