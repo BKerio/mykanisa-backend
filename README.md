@@ -1,66 +1,100 @@
-<p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
+# MYKANISA Backend
 
-<p align="center">
-<a href="https://travis-ci.org/laravel/framework"><img src="https://travis-ci.org/laravel/framework.svg" alt="Build Status"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/dt/laravel/framework" alt="Total Downloads"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/v/laravel/framework" alt="Latest Stable Version"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
-</p>
+This is the backend repository for the **MYKANISA** (Kanisa App) Church Management System. Built on Laravel 9, it serves a comprehensive RESTful API handling multiple aspects of church administration, user management, and automated payments.
 
-## About Laravel
+## Features & Modules
 
-Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
+- **Authentication & Authorization**
+  - Token-based API authentication via **Laravel Sanctum**.
+  - **Role-Based Access Control (RBAC):** Extensive support for various leadership roles and permissions, including Admin, Pastor, Elder, Deacon, Secretary, Treasurer, Chairman, Group Leader, Choir Leader, Sunday School Teacher, and Regular Member.
 
-- [Simple, fast routing engine](https://laravel.com/docs/routing).
-- [Powerful dependency injection container](https://laravel.com/docs/container).
-- Multiple back-ends for [session](https://laravel.com/docs/session) and [cache](https://laravel.com/docs/cache) storage.
-- Expressive, intuitive [database ORM](https://laravel.com/docs/eloquent).
-- Database agnostic [schema migrations](https://laravel.com/docs/migrations).
-- [Robust background job processing](https://laravel.com/docs/queues).
-- [Real-time event broadcasting](https://laravel.com/docs/broadcasting).
+- **Member Management**
+  - Registration and profile management.
+  - Profile avatars and digital file attachments (e.g., passports, marriage certificates).
+  - Dependent tracking.
+  - Member search and discovery for leadership.
 
-Laravel is accessible, powerful, and provides tools required for large, robust applications.
+- **Organizational Structure**
+  - Hierarchical location management: **Regions** > **Presbyteries** > **Parishes** > **Congregations**.
+  - Member grouping (Youth, Choir, Sunday School, Custom Groups, etc.).
 
-## Learning Laravel
+- **Financials & Contributions**
+  - Integrated **Safaricom M-Pesa** payments (STK Push initiation and callback parsing/handling).
+  - Track contributions, pledges, and payment history.
+  - Financial overview, reports, and transaction logs accessible to Treasurers and Admins.
 
-Laravel has the most extensive and thorough [documentation](https://laravel.com/docs) and video tutorial library of all modern web application frameworks, making it a breeze to get started with the framework.
+- **Communications & Events**
+  - Broadcast messaging and announcements directly from leadership.
+  - Push notifications configured via **Firebase (fcm)** using `larafirebase`.
+  - Event creation, announcements, and RSVP functionalities.
 
-You may also try the [Laravel Bootcamp](https://bootcamp.laravel.com), where you will be guided through building a modern Laravel application from scratch.
+- **Administration & Records**
+  - Meeting Minutes tracking and follow-up on action points (Secretaries).
+  - Attendance management & history (Holy Communion, Sunday Services, Events).
+  - QR Code generation and verification for event check-ins.
+  - Robust Audit Logging for communications, tasks, and attendances.
 
-If you don't feel like reading, [Laracasts](https://laracasts.com) can help. Laracasts contains over 2000 video tutorials on a range of topics including Laravel, modern PHP, unit testing, and JavaScript. Boost your skills by digging into our comprehensive video library.
+## Tech Stack
 
-## Laravel Sponsors
+- **Framework:** [Laravel ^9.19](https://laravel.com)
+- **Language:** PHP ^8.0.2
+- **Database:** MySQL / PostgreSQL (managed via Eloquent ORM)
+- **Authentication:** Laravel Sanctum
+- **Push Notifications:** [larafirebase](https://github.com/kutia-software-company/larafirebase)
+- **HTTP Client:** Guzzle
 
-We would like to extend our thanks to the following sponsors for funding Laravel development. If you are interested in becoming a sponsor, please visit the Laravel [Patreon page](https://patreon.com/taylorotwell).
+## Installation & Setup
 
-### Premium Partners
+1. **Clone the repository:**
+   ```bash
+   git clone <repo-url>
+   cd backend
+   ```
 
-- **[Vehikl](https://vehikl.com/)**
-- **[Tighten Co.](https://tighten.co)**
-- **[Kirschbaum Development Group](https://kirschbaumdevelopment.com)**
-- **[64 Robots](https://64robots.com)**
-- **[Cubet Techno Labs](https://cubettech.com)**
-- **[Cyber-Duck](https://cyber-duck.co.uk)**
-- **[Many](https://www.many.co.uk)**
-- **[Webdock, Fast VPS Hosting](https://www.webdock.io/en)**
-- **[DevSquad](https://devsquad.com)**
-- **[Curotec](https://www.curotec.com/services/technologies/laravel/)**
-- **[OP.GG](https://op.gg)**
-- **[WebReinvent](https://webreinvent.com/?utm_source=laravel&utm_medium=github&utm_campaign=patreon-sponsors)**
-- **[Lendio](https://lendio.com)**
+2. **Install Composer dependencies:**
+   ```bash
+   composer install
+   ```
 
-## Contributing
+3. **Configure Environment:**
+   Copy the example environment variables file and update your database and API credentials (including M-Pesa and FCM keys).
+   ```bash
+   cp .env.example .env
+   ```
 
-Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
+4. **Generate Application Key:**
+   ```bash
+   php artisan key:generate
+   ```
 
-## Code of Conduct
+5. **Run Database Migrations and Seeders:**
+   Make sure you have an empty database ready and correctly referenced in `.env`.
+   ```bash
+   php artisan migrate --seed
+   ```
 
-In order to ensure that the Laravel community is welcoming to all, please review and abide by the [Code of Conduct](https://laravel.com/docs/contributions#code-of-conduct).
+6. **Serve the Application:**
+   ```bash
+   php artisan serve
+   ```
+   *The API will be available at `http://localhost:8000/api`*
 
-## Security Vulnerabilities
+## API Architecture Overview
 
-If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
+The API is heavily namespaced depending on the user interaction context:
+- `routes/api.php` includes segregated grouping for:
+  - **Public/Guest Endpoints**: Login, Register, Password Reset, M-Pesa Callbacks.
+  - **Leadership Scopes**: `admin/*`, `pastor/*`, `elder/*`, `deacon/*`, `treasurer/*`, `secretary/*`, etc.
+  - **General Authed**: `member/*` routes for personal profiles, pledges, and digital files.
+
+## Third-Party Integrations
+- **Safaricom Daraja API:** For direct C2B or STK push payments. Requires credentials configured in the `.env` file (e.g., consumer key, secret, passkey, shortcode).
+- **Firebase Cloud Messaging (FCM):** Push notification routing. Make sure your server key is defined in the environment.
+
+## Contribution Guidelines
+
+To contribute, follow general PSR-12 coding standard guidelines. Create feature branches mapped to active tickets and submit pull requests accompanied by adequate test coverage.
 
 ## License
 
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+This project is proprietary software belonging to the MYKANISA development team phase/organization. Unauthorized copying or distributing of this software is strictly prohibited unless explicitly stated otherwise.
