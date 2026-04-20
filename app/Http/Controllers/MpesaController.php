@@ -47,31 +47,43 @@ class MpesaController extends Controller
             'breakdown' => $breakdown
         ]);
         
-        $response = $this->mpesa->stkPush($request->phone, $request->amount, $reference);
+        try {
+            $response = $this->mpesa->stkPush($request->phone, $request->amount, $reference);
 
-        // Store the account reference and breakdown temporarily for callback retrieval
-        if (isset($response['CheckoutRequestID'])) {
-            $this->storeAccountReference($response['CheckoutRequestID'], $reference);
-            if (!empty($breakdown)) {
-                $this->storeBreakdown($response['CheckoutRequestID'], $breakdown);
-            }
-            // Store is_pledge flag
-            \Illuminate\Support\Facades\Cache::put(
-                "mpesa_is_pledge_{$response['CheckoutRequestID']}",
-                $isPledge,
-                now()->addHours(24)
-            );
-            
-            if ($pledgePeriod) {
+            // Store the account reference and breakdown temporarily for callback retrieval
+            if (isset($response['CheckoutRequestID'])) {
+                $this->storeAccountReference($response['CheckoutRequestID'], $reference);
+                if (!empty($breakdown)) {
+                    $this->storeBreakdown($response['CheckoutRequestID'], $breakdown);
+                }
+                // Store is_pledge flag
                 \Illuminate\Support\Facades\Cache::put(
-                    "mpesa_pledge_period_{$response['CheckoutRequestID']}",
-                    $pledgePeriod,
+                    "mpesa_is_pledge_{$response['CheckoutRequestID']}",
+                    $isPledge,
                     now()->addHours(24)
                 );
+                
+                if ($pledgePeriod) {
+                    \Illuminate\Support\Facades\Cache::put(
+                        "mpesa_pledge_period_{$response['CheckoutRequestID']}",
+                        $pledgePeriod,
+                        now()->addHours(24)
+                    );
+                }
             }
-        }
 
-        return response()->json($response);
+            return response()->json($response);
+        } catch (\Illuminate\Http\Client\ConnectionException $e) {
+            Log::error('Mpesa STK Push Connection Timeout: ' . $e->getMessage());
+            return response()->json([
+                'message' => 'Safaricom M-Pesa is currently unreachable or experiencing delays. Please try again later.'
+            ], 503);
+        } catch (\Exception $e) {
+            Log::error('Mpesa STK Push Error: ' . $e->getMessage());
+            return response()->json([
+                'message' => 'An unexpected error occurred while communicating with M-Pesa: ' . $e->getMessage()
+            ], 500);
+        }
     }
 
     public function callback(Request $request)
